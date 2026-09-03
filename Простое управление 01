@@ -1,0 +1,393 @@
+import torch #для работы с многомерными массивами
+import torch.nn as nn #для построения нейронной сети
+import torch.optim as optim #для оптимизации
+import random
+import numpy as np
+import pygame
+import math
+
+from collections import deque #для памяти
+
+N_INPUTS = 8
+N_ACTIONS = 9
+HIDDEN = 64
+
+LR = 0.0003
+GAMMA = 0.85
+BATCH_SIZE = 128
+MEMORY_SIZE = 100_000
+TARGET_UPDATE = 200
+
+EPS_START = 1.0
+EPS_END = 0.05
+EPS_DECAY = 0.995
+
+MAX_SPEED = 10
+
+
+class QNetwork(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(N_INPUTS, HIDDEN), #слой
+            nn.ReLU(), #ф-ция активации
+            nn.Linear(HIDDEN, HIDDEN),
+            nn.ReLU(),
+            nn.Linear(HIDDEN, N_ACTIONS),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buf = deque(maxlen=capacity)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buf.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buf, batch_size) #выбираем определённое количество случайных элементов
+        s, a, r, s2, d = zip(*batch)
+        return (
+            torch.FloatTensor(np.array(s)), #тензор из float32
+            torch.LongTensor(np.array(a, dtype=np.int64)),
+            torch.FloatTensor(r),
+            torch.FloatTensor(np.array(s2)),
+            torch.FloatTensor(d),
+        )
+
+    def __len__(self):
+        return len(self.buf)
+
+
+class DQNAgent:
+    def __init__(self):
+        self.policy_net = QNetwork() # сеть, которую обучаем
+        self.target_net = QNetwork() # стабильная копия для вычисления целевых Q
+        self.target_net.load_state_dict(self.policy_net.state_dict()) #state_dict для получения словаря из всех весов и смещений
+        self.target_net.eval() #переключение в режим оценки
+
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LR)
+        self.memory = ReplayBuffer(MEMORY_SIZE)
+        self.steps = 0
+
+    def get_obs(self, car):
+        """Собрать наблюдение из машины — вектор из 8 чисел."""
+        return car.norm_distance + [car.speed / MAX_SPEED] + [((CHECKPOINTS[car.current_checkpoint_idx][0] - car.x) / WIDTH) + ((CHECKPOINTS[car.current_checkpoint_idx][1] - car.y) / HEIGHT)] + [math.hypot(CHECKPOINTS[car.current_checkpoint_idx][0] - car.x, CHECKPOINTS[car.current_checkpoint_idx][1] - car.y) / WIDTH]
+
+    def choose_action(self, obs, eps):
+        """Epsilon-greedy: случайно или через сеть."""
+        if random.random() < eps:
+            return random.randint(0, N_ACTIONS - 1)
+        with torch.no_grad():
+            t = torch.FloatTensor(obs).unsqueeze(0)   # [1, 6]
+            q = self.policy_net(t)                     # [1, 5]
+            return int(q.argmax(dim=1).item())
+
+    def remember(self, obs, action, reward, next_obs, done):
+        self.memory.push(obs, action, reward, next_obs, done)
+
+    def learn(self):
+        """Один шаг обучения — вызывается каждый игровой шаг."""
+        if len(self.memory) < BATCH_SIZE:
+            return None   # ждём пока наберём достаточно опыта
+
+        s, a, r, s2, d = self.memory.sample(BATCH_SIZE)
+
+        # Текущие Q-значения для выбранных действий
+        # s - 64 * 6
+        q_current = self.policy_net(s).gather(1, a.unsqueeze(1)).squeeze(1)
+        # получаем 64 * 5
+
+        # Целевые Q-значения (формула Беллмана)
+        with torch.no_grad():
+            q_next = self.target_net(s2).max(dim=1).values
+            q_target = r + GAMMA * q_next * (1 - d)
+
+        # ошибка -> обратное распространение
+        loss = nn.MSELoss()(q_current, q_target)
+        loss = nn.SmoothL1Loss()(q_current, q_target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # Периодически копируем веса в target-сеть
+        self.steps += 1
+        if self.steps % TARGET_UPDATE == 0:
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+
+        return loss.item()
+
+    def save(self, path="dqn_weights.pth"):
+        torch.save(self.policy_net.state_dict(), path)
+        print(f"Модель сохранена {path}")
+
+    def load(self, path="dqn_weights.pth"):
+        self.policy_net.load_state_dict(torch.load(path))
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        print(f"Модель загружена {path}")
+
+
+pygame.init()
+WIDTH, HEIGHT = 900, 700
+
+LEVEL = 2
+if LEVEL == 1:
+    walls = [[(50, 100), (850, 100)], [(50, 250), (700, 250)],
+             [(850, 100), (850, 600)], [(700, 250), (700, 600)]]
+    CHECKPOINTS = [(400, 175), (775, 300)]
+    ST_X, ST_Y = 60, 175
+elif LEVEL == 2:
+    walls = [[(50, 50), (850, 50)], [(850, 50), (850, 650)],
+             [(850, 650), (50, 650)], [(50, 650), (50, 50)],
+             [(200, 200), (700, 200)], [(700, 200), (700, 500)],
+             [(700, 500), (200, 500)], [(200, 500), (200, 200)]]
+    CHECKPOINTS = [(450, 575), (775, 350), (450, 125), (125, 350)]
+    ST_X, ST_Y = 150, 550
+else:
+    walls = [[(50, 50), (270, 50)], [(150, 150), (170, 150)],
+             [(170, 150), (170, 400)], [(170, 500), (170, 650)],
+             [(270, 50), (270, 400)], [(270, 500), (270, 550)],
+             [(170, 650), (850, 650)], [(270, 550), (750, 550)],
+             [(750, 550), (750, 150)], [(850, 650), (850, 50)],
+             [(850, 50), (400, 50)], [(750, 150), (500, 150)],
+             [(500, 150), (500, 500)], [(400, 50), (400, 400)],
+             [(400, 400), (270, 400)], [(170, 400), (150, 400)],
+             [(500, 500), (270, 500)], [(170, 500), (50, 500)],
+             [(50, 500), (50, 50)], [(150, 400), (150, 150)]]
+    CHECKPOINTS = [(220, 175), (220, 550), (700, 600), (800, 200), (450, 200), (100, 450)]
+    ST_X, ST_Y = 100, 100
+
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("DQN Car")
+myfont = pygame.font.SysFont('Arial', 18)
+clock = pygame.time.Clock()
+MAX_RAY_LEN = 200
+
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+RED = (250, 0, 0)
+GREEN = (0, 250, 0)
+
+
+class Car:
+    def __init__(self, x, y):
+        self.start_x = x
+        self.start_y = y
+        self.max_speed = MAX_SPEED
+        self.rotation_speed = 3
+        self.width = 30
+        self.height = 15
+        self.surface = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        self.surface.fill(RED)
+        self.reset()
+
+    def reset(self):
+        self.x = self.start_x
+        self.y = self.start_y
+        self.speed = 2.0
+        self.angle = 0
+        self.alive = True
+        self.reward = 0
+        self.unreward = 0
+        self.break_t = 0
+        self.norm_distance = [1.0] * 5
+        self.distance = [MAX_RAY_LEN] * 5
+        self.current_checkpoint_idx = 0
+
+    def drive(self):
+        rad = math.radians(self.angle)
+        self.x += math.cos(rad) * self.speed
+        self.y -= math.sin(rad) * self.speed
+
+    def get_intersection(self, p1, p2, p3, p4):
+        x1,y1=p1; x2,y2=p2; x3,y3=p3; x4,y4=p4
+        denom = (y4-y3)*(x2-x1) - (x4-x3)*(y2-y1)
+        if denom == 0: return None
+        ua = ((x4-x3)*(y1-y3) - (y4-y3)*(x1-x3)) / denom
+        ub = ((x2-x1)*(y1-y3) - (y2-y1)*(x1-x3)) / denom
+        if 0 <= ua <= 1 and 0 <= ub <= 1:
+            return (x1 + ua * (x2 - x1), y1 + ua * (y2 - y1))
+        return None
+
+    def cast_rays(self, walls):
+        ray_angles = [self.angle-60, self.angle-30, self.angle,
+                      self.angle+30, self.angle+60]
+        self.norm_distance = []
+        self.distance = []
+        for ra in ray_angles:
+            rad = math.radians(ra)
+            dx = self.x + math.cos(rad)*MAX_RAY_LEN
+            dy = self.y - math.sin(rad)*MAX_RAY_LEN
+            closest = MAX_RAY_LEN
+            for wall in walls:
+                pt = self.get_intersection((self.x,self.y),(dx,dy),wall[0],wall[1])
+                if pt:
+                    d = math.hypot(pt[0]-self.x, pt[1]-self.y)
+                    if d < closest: closest = d
+            self.norm_distance.append(closest/MAX_RAY_LEN)
+            self.distance.append(closest)
+            color = GREEN if closest>50 else RED
+            pygame.draw.line(screen, color, (self.x,self.y),
+                             (self.x+math.cos(rad)*closest,
+                              self.y-math.sin(rad)*closest))
+
+    def check_collision(self, walls):
+        rad = math.radians(self.angle)
+        cos_a = math.cos(rad); sin_a = math.sin(rad)
+        w = self.width/2;      h = self.height/2
+        corners = [(w,h),(w,-h),(-w,-h),(-w,h)]
+        world = [(self.x+lx*cos_a+ly*sin_a,
+                    self.y-lx*sin_a+ly*cos_a) for lx,ly in corners]
+        sides = [(world[i], world[(i+1) % 4]) for i in range(4)]
+        for side in sides:
+            for wall in walls:
+                if self.get_intersection(side[0],side[1],wall[0],wall[1]):
+                    self.alive = False; return True
+        if not (0 < self.x < WIDTH and 0 < self.y < HEIGHT):
+            self.alive = False; return True
+        return False
+
+    def check_checkpoint(self):
+        cx, cy = CHECKPOINTS[self.current_checkpoint_idx]
+        if math.hypot(cx-self.x, cy-self.y) < 55:
+            self.current_checkpoint_idx = (self.current_checkpoint_idx+1) % len(CHECKPOINTS)
+            return 35.0 #30.0
+        return 0.0
+
+    def apply_action(self, action):
+        if not self.alive: return
+        if action == 1:
+            self.angle -= self.rotation_speed; self.speed *= 0.99
+        elif action == 2:
+            self.angle += self.rotation_speed; self.speed *= 0.99
+        elif action == 3 and self.speed < self.max_speed:
+            self.speed += 0.1
+        elif action == 4 and self.speed > 0:
+            self.speed -= 0.1; self.break_t += 1
+        elif action == 5:
+            self.angle -= self.rotation_speed
+            self.speed += 0.1
+        elif action == 6:
+            self.angle += self.rotation_speed
+            self.speed += 0.1
+        elif action == 7:
+            self.angle -= self.rotation_speed
+            self.speed -= 0.1
+        elif action == 8:
+            self.speed -= 0.1
+            self.angle += self.rotation_speed
+        else:
+            self.speed *= 0.99; self.break_t = 0
+
+    def draw(self):
+        rotated = pygame.transform.rotate(self.surface, self.angle)
+        screen.blit(rotated, rotated.get_rect(center=(self.x,self.y)))
+
+
+def compute_reward(car):
+    r = 1.1 * car.speed/MAX_SPEED #или штрафовать
+    r += car.check_checkpoint()
+    min_dist = min(car.distance) if car.distance else MAX_RAY_LEN
+    if min_dist < 35:
+        pen = (35-min_dist)*0.15; r -= pen; car.unreward += pen
+    if car.break_t > 25:
+        r -= 5; car.unreward += 5
+    if car.speed == 0:
+        r -= 1
+    car.reward += r
+    return r
+
+
+def draw_hud(episod, eps, ep_reward, loss):
+    screen.blit(myfont.render(f"Ep:{episod}",       True, BLACK), (5, 50))
+    screen.blit(myfont.render(f"EPS:{eps:.3f}",     True, BLACK), (5, 68))
+    screen.blit(myfont.render(f"R:{ep_reward:.1f}", True, (0,160,0)), (5, 86))
+    screen.blit(myfont.render(f"Reward:{int(car.reward)}", True, (0,200,0)), (400, 5))
+    screen.blit(myfont.render(f"Speed:{int(car.speed)}",   True, BLACK), (550, 5))
+    if loss is not None:
+        screen.blit(myfont.render(f"Loss:{loss:.4f}", True, (180,80,0)), (5, 104))
+
+
+car = Car(ST_X, ST_Y)
+agent = DQNAgent()
+eps = EPS_START
+episod = 0
+ep_reward = 0.0
+last_loss = None
+ep_rewards = []
+dist_to_chpnt = math.hypot(CHECKPOINTS[car.current_checkpoint_idx][0] - car.x, CHECKPOINTS[car.current_checkpoint_idx][1] - car.y)
+
+running = True
+while running:
+    screen.fill(WHITE)
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_s:
+                agent.save()
+            if event.key == pygame.K_l:
+                agent.load()
+
+    for wall in walls:
+        pygame.draw.line(screen, BLACK, wall[0], wall[1])
+
+    for idx, cp in enumerate(CHECKPOINTS):
+        is_active = (idx == car.current_checkpoint_idx)
+        pygame.draw.circle(screen, GREEN if is_active else (180,180,180), cp, 12)
+        if is_active:
+            pygame.draw.circle(screen, GREEN, cp, 55, 1)
+
+    # Шаг обучения
+    car.cast_rays(walls)
+    obs = agent.get_obs(car)
+    action = agent.choose_action(obs, eps)
+
+    car.apply_action(action)
+    car.drive()
+    car.cast_rays(walls)
+    car.check_collision(walls)
+
+    next_obs = agent.get_obs(car)
+    done = not car.alive
+
+    if car.alive:
+        step_reward = compute_reward(car)
+        if dist_to_chpnt > math.hypot(CHECKPOINTS[car.current_checkpoint_idx][0] - car.x, CHECKPOINTS[car.current_checkpoint_idx][1] - car.y):
+            step_reward += 1
+    else:
+        step_reward = -350.0 #-300
+
+    ep_reward += step_reward
+
+    # Сохраняем опыт и учимся
+    agent.remember(obs, action, step_reward, next_obs, done)
+    last_loss = agent.learn()
+
+    # Отрисовка
+    car.draw()
+    draw_hud(episod, eps, ep_reward, last_loss)
+    screen.blit(myfont.render(f"Action:{action}", True, (0,0,200)), (5, 20))
+
+    pygame.display.flip()
+    # clock.tick(60) если нужно замедлить
+
+    # Конец эпизода
+    if done:
+        ep_rewards.append(ep_reward)
+        ep_reward = 0.0
+        episod += 1
+        eps = max(EPS_END, eps * EPS_DECAY)
+        car.reset()
+
+        if episod % 50 == 0:
+            agent.save()
+            np.save("reward_history_dqn.npy", np.array(ep_rewards))
+            avg = np.mean(ep_rewards[-50:])
+            print(f"Ep {episod:4d} | eps={eps:.3f} | avg_reward={avg:.1f}")
+
+pygame.quit()
