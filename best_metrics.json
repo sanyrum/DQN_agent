@@ -1,0 +1,10 @@
+{
+  "training_step": 60000,
+  "checkpoints": 40,
+  "collision": false,
+  "steps": 3000,
+  "steps_to_last_checkpoint": 2994,
+  "reward": 4453.595378698094,
+  "truncated": true,
+  "is_best": true
+}
